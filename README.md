@@ -1,3 +1,56 @@
+> **This is a fork of [Apple's ml-sharp](https://github.com/apple/ml-sharp) repository.**
+>
+
+## Cloud GPU Inference (No Local GPU Required)
+
+Generate Gaussian splats using [Modal](https://modal.com)'s cloud GPUs. Modal offers a free tier with $30/month in credits.
+
+### Setup (One-Time)
+
+```bash
+# Install with cloud support
+uv pip install -e ".[cloud]"
+
+# Create Modal account and authenticate
+uv run modal token new
+```
+
+### Optional: Pre-warm Model Cache
+
+```bash
+uv run sharp cloud setup
+```
+
+This downloads the ~800MB model to Modal's cloud storage, making subsequent runs faster.
+
+### Usage
+
+```bash
+# Run inference on cloud GPU (default: A10 @ $1.10/hr)
+uv run sharp cloud predict -i photo.jpg -o output/
+
+# Process multiple images
+uv run sharp cloud predict -i photos/ -o output/
+
+# Choose GPU tier
+uv run sharp cloud predict -i photo.jpg -o output/ --gpu t4    # $0.59/hr (budget)
+uv run sharp cloud predict -i photo.jpg -o output/ --gpu h100  # $3.95/hr (fastest)
+```
+
+### Available GPU Tiers
+
+| GPU  | Price/hr | Notes             |
+| ---- | -------- | ----------------- |
+| T4   | $0.59    | Budget option     |
+| L4   | $0.80    | Good value        |
+| A10  | $1.10    | Default, balanced |
+| A100 | $2.50    | High performance  |
+| H100 | $3.95    | Fastest           |
+
+---
+
+## Original README from [apple/ml-sharp](https://github.com/apple/ml-sharp)
+
 # Sharp Monocular View Synthesis in Less Than a Second
 
 [![Project Page](https://img.shields.io/badge/Project-Page-green)](https://apple.github.io/ml-sharp/)
