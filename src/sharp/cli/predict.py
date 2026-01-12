@@ -99,15 +99,26 @@ def predict_cli(
     # Normalize export formats to lowercase
     export_formats = tuple(fmt.lower() for fmt in export_formats)
 
-    extensions = io.get_supported_image_extensions()
+    extensions = {ext.lower() for ext in io.get_supported_image_extensions()}
 
     image_paths = []
     if input_path.is_file():
-        if input_path.suffix in extensions:
+        if input_path.suffix.lower() in extensions:
             image_paths = [input_path]
     else:
-        for ext in extensions:
-            image_paths.extend(list(input_path.glob(f"**/*{ext}")))
+        seen = set()
+        for candidate_path in input_path.rglob("*"):
+            if not candidate_path.is_file():
+                continue
+            if candidate_path.suffix.lower() not in extensions:
+                continue
+
+            resolved = candidate_path.resolve()
+            if resolved in seen:
+                continue
+
+            seen.add(resolved)
+            image_paths.append(candidate_path)
 
     if len(image_paths) == 0:
         LOGGER.info("No valid images found. Input was %s.", input_path)

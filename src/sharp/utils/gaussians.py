@@ -320,17 +320,14 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
     # Parse color space.
     color_space_index = supplement_data.get("color_space", 1)
     color_space = cs_utils.decode_color_space(color_space_index)
-    colors = torch.from_numpy(colors).view(1, -1, 3).float()
-
     if color_space == "sRGB":
-        # Convert to linearRGB for proper alpha blending.
-        colors = cs_utils.sRGB2linearRGB(colors.flatten(0, 1)).view(1, -1, 3)
-        color_space = "linearRGB"
+        colors = cs_utils.sRGB2linearRGB(colors)
 
     mean_vectors = torch.from_numpy(mean_vectors).view(1, -1, 3).float()
     quaternions = torch.from_numpy(quaternions).view(1, -1, 4).float()
     singular_values = torch.exp(torch.from_numpy(scale_logits).view(1, -1, 3)).float()
     opacities = torch.sigmoid(torch.from_numpy(opacity_logits).view(1, -1)).float()
+    colors = torch.from_numpy(colors).view(1, -1, 3).float()
 
     gaussians = Gaussians3D(
         mean_vectors=mean_vectors,
@@ -541,10 +538,13 @@ def save_sog(
     xyz = gaussians.mean_vectors.flatten(0, 1).cpu().numpy()
     scales = gaussians.singular_values.flatten(0, 1).cpu().numpy()
     quats = gaussians.quaternions.flatten(0, 1).cpu().numpy()
-    colors_linear = gaussians.colors.flatten(0, 1).cpu().numpy()
+    # Convert linear RGB to sRGB for compatibility with public renderers
+    # (same as save_ply and save_splat)
+    colors_srgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).cpu().numpy()
     opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
 
     num_gaussians = len(xyz)
+    xyz_raw = xyz
 
     # Compute image dimensions (roughly square)
     img_width = int(math.ceil(math.sqrt(num_gaussians)))
@@ -561,7 +561,7 @@ def save_sog(
     xyz = pad_array(xyz, total_pixels)
     scales = pad_array(scales, total_pixels)
     quats = pad_array(quats, total_pixels)
-    colors_linear = pad_array(colors_linear, total_pixels)
+    colors_srgb = pad_array(colors_srgb, total_pixels)
     opacities = pad_array(opacities, total_pixels)
 
     # Normalize quaternions
@@ -647,7 +647,7 @@ def save_sog(
 
     # === 4. Build SH0 codebook and encode colors ===
     SH_C0 = 0.28209479177387814
-    sh0_coeffs = (colors_linear - 0.5) / SH_C0
+    sh0_coeffs = (colors_srgb - 0.5) / SH_C0
     sh0_flat = sh0_coeffs.flatten()
 
     sh0_percentiles = np.linspace(0, 100, 256)
@@ -677,6 +677,28 @@ def save_sog(
     sh0_img = create_image(sh0_data, img_width, img_height)
 
     # === 6. Create meta.json ===
+    image_height, image_width = image_shape
+    intrinsic = np.array(
+        [
+            f_px,
+            0,
+            image_width * 0.5,
+            0,
+            f_px,
+            image_height * 0.5,
+            0,
+            0,
+            1,
+        ],
+        dtype=np.float32,
+    )
+    extrinsic = np.eye(4, dtype=np.float32)
+    frame = np.array([1, num_gaussians], dtype=np.int32)
+    disparity = 1.0 / xyz_raw[:, 2]
+    disparity_quantiles = np.quantile(disparity, [0.1, 0.9]).astype(np.float32)
+    color_space_index = cs_utils.encode_color_space("sRGB")
+    ply_version = np.array([1, 5, 0], dtype=np.uint8)
+
     meta = {
         "version": 2,
         "count": num_gaussians,
@@ -689,6 +711,15 @@ def save_sog(
         "scales": {"codebook": scale_codebook.tolist(), "files": ["scales.webp"]},
         "quats": {"files": ["quats.webp"]},
         "sh0": {"codebook": sh0_codebook.tolist(), "files": ["sh0.webp"]},
+        "sharp_metadata": {
+            "image_size": [int(image_width), int(image_height)],
+            "intrinsic": intrinsic.flatten().tolist(),
+            "extrinsic": extrinsic.flatten().tolist(),
+            "frame": frame.tolist(),
+            "disparity": disparity_quantiles.tolist(),
+            "color_space": int(color_space_index),
+            "version": ply_version.tolist(),
+        },
     }
 
     # === 7. Save as ZIP archive ===
@@ -696,7 +727,7 @@ def save_sog(
     if path.suffix.lower() != ".sog":
         path = path.with_suffix(".sog")
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
         # Save images as lossless WebP
         for name, img in [
             ("means_l.webp", means_l_img),
