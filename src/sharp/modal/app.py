@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import modal
 
@@ -237,6 +237,254 @@ def _serialize_ply_to_bytes(
     return buffer.read()
 
 
+def _serialize_splat_to_bytes(
+    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int]
+) -> bytes:
+    """Serialize Gaussians3D to SPLAT bytes."""
+    import numpy as np
+
+    from sharp.utils import color_space as cs_utils
+
+    xyz = gaussians.mean_vectors.flatten(0, 1).cpu().numpy()
+    scales = gaussians.singular_values.flatten(0, 1).cpu().numpy()
+    quats = gaussians.quaternions.flatten(0, 1).cpu().numpy()
+    colors_rgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).cpu().numpy()
+    opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
+
+    sort_idx = np.argsort(-(scales.prod(axis=1) * opacities))
+    quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
+
+    buffer = io.BytesIO()
+    for i in sort_idx:
+        buffer.write(xyz[i].astype(np.float32).tobytes())
+        buffer.write(scales[i].astype(np.float32).tobytes())
+        rgba = np.concatenate([colors_rgb[i], [opacities[i]]])
+        buffer.write((rgba * 255).clip(0, 255).astype(np.uint8).tobytes())
+        buffer.write((quats[i] * 128 + 128).clip(0, 255).astype(np.uint8).tobytes())
+
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _serialize_sog_to_bytes(
+    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int]
+) -> bytes:
+    """Serialize Gaussians3D to SOG bytes (zip archive)."""
+    import io as stdlib_io
+    import json
+    import math
+    import zipfile
+
+    import numpy as np
+    from PIL import Image
+
+    from sharp.utils import color_space as cs_utils
+
+    xyz = gaussians.mean_vectors.flatten(0, 1).cpu().numpy()
+    scales = gaussians.singular_values.flatten(0, 1).cpu().numpy()
+    quats = gaussians.quaternions.flatten(0, 1).cpu().numpy()
+    colors_srgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).cpu().numpy()
+    opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
+
+    num_gaussians = len(xyz)
+    xyz_raw = xyz
+
+    img_width = int(math.ceil(math.sqrt(num_gaussians)))
+    img_height = int(math.ceil(num_gaussians / img_width))
+    total_pixels = img_width * img_height
+
+    def pad_array(arr: np.ndarray, total: int) -> np.ndarray:
+        if len(arr) < total:
+            pad_shape = (total - len(arr),) + arr.shape[1:]
+            return np.concatenate([arr, np.zeros(pad_shape, dtype=arr.dtype)])
+        return arr
+
+    xyz = pad_array(xyz, total_pixels)
+    scales = pad_array(scales, total_pixels)
+    quats = pad_array(quats, total_pixels)
+    colors_srgb = pad_array(colors_srgb, total_pixels)
+    opacities = pad_array(opacities, total_pixels)
+
+    quats = quats / (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-8)
+
+    def symlog(x: np.ndarray) -> np.ndarray:
+        return np.sign(x) * np.log1p(np.abs(x))
+
+    xyz_log = symlog(xyz)
+    mins = xyz_log.min(axis=0)
+    maxs = xyz_log.max(axis=0)
+    ranges = maxs - mins
+    ranges = np.where(ranges < 1e-8, 1.0, ranges)
+
+    xyz_norm = (xyz_log - mins) / ranges
+    xyz_q16 = (xyz_norm * 65535).clip(0, 65535).astype(np.uint16)
+
+    means_l = (xyz_q16 & 0xFF).astype(np.uint8)
+    means_u = (xyz_q16 >> 8).astype(np.uint8)
+
+    def encode_quaternion(q: np.ndarray) -> np.ndarray:
+        abs_q = np.abs(q)
+        mode = np.argmax(abs_q, axis=1)
+        signs = np.sign(q[np.arange(len(q)), mode])
+        q = q * signs[:, None]
+
+        result = np.zeros((len(q), 4), dtype=np.uint8)
+        sqrt2_inv = 1.0 / math.sqrt(2)
+
+        for i in range(len(q)):
+            m = mode[i]
+            kept = [j for j in range(4) if j != m]
+            vals = q[i, kept]
+            encoded = ((vals * sqrt2_inv + 0.5) * 255).clip(0, 255).astype(np.uint8)
+            result[i, :3] = encoded
+            result[i, 3] = 252 + m
+
+        return result
+
+    quats_encoded = encode_quaternion(quats)
+
+    scales_log = np.log(np.maximum(scales, 1e-10))
+    scales_log_flat = scales_log.flatten()
+
+    percentiles = np.linspace(0, 100, 256)
+    scale_codebook = np.percentile(scales_log_flat, percentiles).astype(np.float32)
+
+    def quantize_to_codebook(values: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+        indices = np.searchsorted(codebook, values)
+        indices = np.clip(indices, 0, len(codebook) - 1)
+        prev_indices = np.clip(indices - 1, 0, len(codebook) - 1)
+        dist_curr = np.abs(values - codebook[indices])
+        dist_prev = np.abs(values - codebook[prev_indices])
+        use_prev = (dist_prev < dist_curr) & (indices > 0)
+        indices = np.where(use_prev, prev_indices, indices)
+        return indices.astype(np.uint8)
+
+    scales_q = np.stack(
+        [
+            quantize_to_codebook(scales_log[:, 0], scale_codebook),
+            quantize_to_codebook(scales_log[:, 1], scale_codebook),
+            quantize_to_codebook(scales_log[:, 2], scale_codebook),
+        ],
+        axis=1,
+    )
+
+    SH_C0 = 0.28209479177387814
+    sh0_coeffs = (colors_srgb - 0.5) / SH_C0
+    sh0_flat = sh0_coeffs.flatten()
+
+    sh0_percentiles = np.linspace(0, 100, 256)
+    sh0_codebook = np.percentile(sh0_flat, sh0_percentiles).astype(np.float32)
+
+    sh0_r = quantize_to_codebook(sh0_coeffs[:, 0], sh0_codebook)
+    sh0_g = quantize_to_codebook(sh0_coeffs[:, 1], sh0_codebook)
+    sh0_b = quantize_to_codebook(sh0_coeffs[:, 2], sh0_codebook)
+    sh0_a = (opacities * 255).clip(0, 255).astype(np.uint8)
+
+    def create_image(data: np.ndarray, width: int, height: int) -> Image.Image:
+        data = data.reshape(height, width, -1)
+        if data.shape[2] == 3:
+            return Image.fromarray(data, mode="RGB")
+        if data.shape[2] == 4:
+            return Image.fromarray(data, mode="RGBA")
+        raise ValueError(f"Unexpected channel count: {data.shape[2]}")
+
+    means_l_img = create_image(means_l, img_width, img_height)
+    means_u_img = create_image(means_u, img_width, img_height)
+    quats_img = create_image(quats_encoded, img_width, img_height)
+    scales_img = create_image(scales_q, img_width, img_height)
+
+    sh0_data = np.stack([sh0_r, sh0_g, sh0_b, sh0_a], axis=1)
+    sh0_img = create_image(sh0_data, img_width, img_height)
+
+    image_height, image_width = image_shape
+    intrinsic = np.array(
+        [
+            f_px,
+            0,
+            image_width * 0.5,
+            0,
+            f_px,
+            image_height * 0.5,
+            0,
+            0,
+            1,
+        ],
+        dtype=np.float32,
+    )
+    extrinsic = np.eye(4, dtype=np.float32)
+    frame = np.array([1, num_gaussians], dtype=np.int32)
+    disparity = 1.0 / xyz_raw[:, 2]
+    disparity_quantiles = np.quantile(disparity, [0.1, 0.9]).astype(np.float32)
+    color_space_index = cs_utils.encode_color_space("sRGB")
+    ply_version = np.array([1, 5, 0], dtype=np.uint8)
+
+    meta = {
+        "version": 2,
+        "count": num_gaussians,
+        "antialias": False,
+        "means": {
+            "mins": mins.tolist(),
+            "maxs": maxs.tolist(),
+            "files": ["means_l.webp", "means_u.webp"],
+        },
+        "scales": {"codebook": scale_codebook.tolist(), "files": ["scales.webp"]},
+        "quats": {"files": ["quats.webp"]},
+        "sh0": {"codebook": sh0_codebook.tolist(), "files": ["sh0.webp"]},
+        "sharp_metadata": {
+            "image_size": [int(image_width), int(image_height)],
+            "intrinsic": intrinsic.flatten().tolist(),
+            "extrinsic": extrinsic.flatten().tolist(),
+            "frame": frame.tolist(),
+            "disparity": disparity_quantiles.tolist(),
+            "color_space": int(color_space_index),
+            "version": ply_version.tolist(),
+        },
+    }
+
+    buffer = stdlib_io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as zf:
+        for name, img in [
+            ("means_l.webp", means_l_img),
+            ("means_u.webp", means_u_img),
+            ("quats.webp", quats_img),
+            ("scales.webp", scales_img),
+            ("sh0.webp", sh0_img),
+        ]:
+            img_buf = stdlib_io.BytesIO()
+            img.save(img_buf, format="WEBP", lossless=True)
+            zf.writestr(name, img_buf.getvalue())
+
+        zf.writestr("meta.json", json.dumps(meta, indent=2))
+
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _serialize_outputs(
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
+    filename: str,
+    export_formats: Sequence[str],
+) -> list[tuple[str, bytes]]:
+    base = Path(filename).stem
+    outputs: list[tuple[str, bytes]] = []
+
+    for fmt in export_formats:
+        if fmt == "ply":
+            outputs.append((f"{base}.ply", _serialize_ply_to_bytes(gaussians, f_px, image_shape)))
+        elif fmt == "splat":
+            outputs.append(
+                (f"{base}.splat", _serialize_splat_to_bytes(gaussians, f_px, image_shape))
+            )
+        elif fmt == "sog":
+            outputs.append((f"{base}.sog", _serialize_sog_to_bytes(gaussians, f_px, image_shape)))
+        else:
+            LOGGER.warning("Unknown export format: %s", fmt)
+
+    return outputs
+
+
 # GPU-specific function variants
 @app.function(
     gpu="t4",
@@ -244,9 +492,11 @@ def _serialize_ply_to_bytes(
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_t4(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_t4(
+    image_bytes: bytes, filename: str, export_formats: Sequence[str] | None = None
+) -> list[tuple[str, bytes]]:
     """Run inference on T4 GPU ($0.59/hr, budget option)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_impl(image_bytes, filename, export_formats)
 
 
 @app.function(
@@ -255,9 +505,11 @@ def predict_gaussian_splat_t4(image_bytes: bytes, filename: str) -> tuple[str, b
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_l4(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_l4(
+    image_bytes: bytes, filename: str, export_formats: Sequence[str] | None = None
+) -> list[tuple[str, bytes]]:
     """Run inference on L4 GPU ($0.80/hr)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_impl(image_bytes, filename, export_formats)
 
 
 @app.function(
@@ -266,9 +518,11 @@ def predict_gaussian_splat_l4(image_bytes: bytes, filename: str) -> tuple[str, b
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_a10(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_a10(
+    image_bytes: bytes, filename: str, export_formats: Sequence[str] | None = None
+) -> list[tuple[str, bytes]]:
     """Run inference on A10 GPU ($1.10/hr, default)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_impl(image_bytes, filename, export_formats)
 
 
 @app.function(
@@ -277,9 +531,11 @@ def predict_gaussian_splat_a10(image_bytes: bytes, filename: str) -> tuple[str, 
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_a100(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_a100(
+    image_bytes: bytes, filename: str, export_formats: Sequence[str] | None = None
+) -> list[tuple[str, bytes]]:
     """Run inference on A100 GPU ($2.50/hr)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_impl(image_bytes, filename, export_formats)
 
 
 @app.function(
@@ -288,12 +544,16 @@ def predict_gaussian_splat_a100(image_bytes: bytes, filename: str) -> tuple[str,
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_h100(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_h100(
+    image_bytes: bytes, filename: str, export_formats: Sequence[str] | None = None
+) -> list[tuple[str, bytes]]:
     """Run inference on H100 GPU ($3.95/hr, fastest)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_impl(image_bytes, filename, export_formats)
 
 
-def _predict_impl(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def _predict_impl(
+    image_bytes: bytes, filename: str, export_formats: Sequence[str] | None = None
+) -> list[tuple[str, bytes]]:
     """Shared implementation for all GPU variants.
 
     This is called by the GPU-specific functions and contains the actual
@@ -382,13 +642,13 @@ def _predict_impl(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
         gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
     )
 
-    LOGGER.info("Serializing to PLY")
-    ply_bytes = _serialize_ply_to_bytes(gaussians, f_px, (height, width))
+    export_formats = tuple(fmt.lower() for fmt in (export_formats or ("ply",)))
 
-    output_filename = Path(filename).stem + ".ply"
+    LOGGER.info("Serializing outputs: %s", ", ".join(export_formats))
+    outputs = _serialize_outputs(gaussians, f_px, (height, width), filename, export_formats)
+
     LOGGER.info(f"Done processing {filename}")
-
-    return output_filename, ply_bytes
+    return outputs
 
 
 def get_predict_function(gpu_tier: GpuTier = "a10"):

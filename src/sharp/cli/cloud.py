@@ -50,8 +50,17 @@ def cloud_cli():
     "-o",
     "--output-path",
     type=click.Path(path_type=Path, file_okay=False),
-    help="Path to save the predicted Gaussians (.ply files).",
+    help="Path to save the predicted Gaussians (ply / splat / sog).",
     required=True,
+)
+@click.option(
+    "-f",
+    "--format",
+    "export_formats",
+    type=click.Choice(["ply", "splat", "sog"], case_sensitive=False),
+    multiple=True,
+    default=["ply"],
+    help="Output format(s). Can specify multiple: -f ply -f splat -f sog",
 )
 @click.option(
     "--gpu",
@@ -63,6 +72,7 @@ def cloud_cli():
 def cloud_predict_cli(
     input_path: Path,
     output_path: Path,
+    export_formats: tuple[str, ...],
     gpu: GpuTier,
     verbose: bool,
 ):
@@ -70,7 +80,7 @@ def cloud_predict_cli(
 
     This command uploads your images to Modal's cloud infrastructure,
     runs inference on the specified GPU tier, and downloads the resulting
-    .ply files to your local machine.
+    files (ply / splat / sog) to your local machine.
 
     Examples:
         sharp cloud predict -i photo.jpg -o output/
@@ -78,6 +88,8 @@ def cloud_predict_cli(
         sharp cloud predict -i photos/ -o output/ --gpu a100
     """
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
+
+    export_formats = tuple(fmt.lower() for fmt in export_formats)
 
     if not check_modal_installed():
         click.echo(
@@ -109,7 +121,12 @@ def cloud_predict_cli(
         LOGGER.info("No valid images found. Input was %s.", input_path)
         return
 
-    LOGGER.info("Processing %d image(s) on Modal with GPU: %s", len(image_paths), gpu)
+    LOGGER.info(
+        "Processing %d image(s) on Modal with GPU: %s (formats: %s)",
+        len(image_paths),
+        gpu,
+        ", ".join(export_formats),
+    )
 
     # Create output directory
     output_path.mkdir(exist_ok=True, parents=True)
@@ -127,15 +144,16 @@ def cloud_predict_cli(
 
             # Call Modal function
             try:
-                output_filename, ply_bytes = predict_fn.remote(
+                output_files = predict_fn.remote(
                     image_bytes=image_bytes,
                     filename=image_path.name,
+                    export_formats=list(export_formats),
                 )
 
-                # Save PLY file
-                output_file = output_path / output_filename
-                output_file.write_bytes(ply_bytes)
-                LOGGER.info("Saved %s", output_file)
+                for output_filename, file_bytes in output_files:
+                    output_file = output_path / output_filename
+                    output_file.write_bytes(file_bytes)
+                    LOGGER.info("Saved %s", output_file)
 
             except Exception as e:
                 LOGGER.error("Failed to process %s: %s", image_path, e)
