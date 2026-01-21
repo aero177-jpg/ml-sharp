@@ -120,6 +120,8 @@ def predict_cli(
             seen.add(resolved)
             image_paths.append(candidate_path)
 
+        image_paths.sort()
+
     if len(image_paths) == 0:
         LOGGER.info("No valid images found. Input was %s.", input_path)
         return
