@@ -39,15 +39,20 @@ def create_monodepth_encoder(
     dims_encoder = [last_encoder] + MONODEPTH_ENCODER_DIMS_MAP[patch_encoder_preset]
     patch_encoder_block_ids = MONODEPTH_HOOK_IDS_MAP[patch_encoder_preset]
 
+    # Create patch encoder with intermediate features for assembly.
     patch_encoder = create_vit(
         preset=patch_encoder_preset,
         intermediate_features_ids=patch_encoder_block_ids,
-        # We always need to output intermediate features for assembly.
     )
-    image_encoder = create_vit(
-        preset=image_encoder_preset,
-        intermediate_features_ids=None,
-    )
+
+    # Reuse patch encoder if both presets are the same, otherwise create a separate image encoder.
+    if patch_encoder_preset == image_encoder_preset:
+        image_encoder = patch_encoder
+    else:
+        image_encoder = create_vit(
+            preset=image_encoder_preset,
+            intermediate_features_ids=None,
+        )
 
     encoder = SlidingPyramidNetwork(
         dims_encoder=dims_encoder,
